@@ -1,0 +1,100 @@
+Technical Report: Peer-to-Peer File Sharing System
+
+Author: Vipin Yadav
+Project: AOS Assignment 3
+
+1. Implementation Approach and Architecture
+
+The system is a multi-threaded, peer-to-peer file-sharing application written in C++17. It follows a hybrid architectural model, utilizing centralized trackers for metadata and coordination while performing file transfers directly between decentralized peers. The entire implementation was built from the ground up using standard C++ libraries and low-level POSIX system calls for networking (<sys/socket.h>) and file I/O (<fcntl.h>, <unistd.h>), strictly avoiding higher-level abstractions like <fstream>.
+
+The architecture consists of two main components:
+
+    Tracker: A multi-threaded server responsible for managing the state of the network. It uses a one-thread-per-connection model, detaching a new std::thread to handle each incoming client or peer tracker. This design is simple and effective for managing concurrent connections without the complexity of an event loop. The tracker's primary roles are user authentication, group management, and storing file metadata.
+
+    Client: A multi-threaded application that serves as the user's portal to the network. Its architecture includes:
+
+        A main thread for the user command-line interface (CLI).
+
+        A detached listener thread that runs a server loop, allowing the client to act as a seeder and serve file pieces to other peers.
+
+        A dynamic worker pool of threads for parallel file downloads, providing a responsive user experience by offloading intensive network operations from the main thread.
+
+2. Synchronization Algorithm Design
+
+To ensure high availability, the system employs two trackers that must maintain a consistent state.
+
+    Algorithm: A Real-time Active-Push synchronization algorithm was implemented. This is a simple yet effective strategy for a two-node system.
+
+    Mechanism: The synchronization is event-driven:
+
+        When a tracker (e.g., Tracker A) receives a command from a client that modifies its state (e.g., create_user, accept_request, upload_file), it first processes the command and updates its local data structures (maps for users, groups, etc.).
+
+        Immediately after a successful state change, it constructs a corresponding command prefixed with SYNC (e.g., SYNC CREATE_USER ...).
+
+        This SYNC command is "pushed" over a persistent TCP connection to the peer tracker (Tracker B).
+
+        Tracker B's main listener thread receives this command, identifies the SYNC prefix, and processes it by applying the exact same state change to its own data structures. All shared data is protected by a std::mutex to ensure these updates are atomic.
+
+    Rationale: For a two-tracker system, a complex consensus algorithm like Paxos or Raft would be overkill. The active-push model was chosen for its simplicity and low latency. It ensures that the secondary tracker is always a hot standby, with its state being a near-perfect mirror of the primary. This design is fundamental to the seamless client-side failover capability.
+
+3. Piece Selection Strategy
+
+To optimize download speed and ensure a non-sequential download pattern, a specific piece selection strategy was implemented in the client.
+
+    Algorithm: Randomized Parallel Fetch.
+
+    Mechanism:
+
+        When a download is initiated, the client creates a std::vector containing the indices of all required file pieces (from 0 to N-1).
+
+        This vector of indices is immediately shuffled using std::shuffle with a hardware-based random number generator (std::random_device).
+
+        A worker pool is spawned, with the number of threads optimized to the system's capabilities via std::thread::hardware_concurrency().
+
+        Instead of using a mutex-protected queue, worker threads efficiently claim tasks by atomically incrementing a shared index (std::atomic<size_t>) that points to the next available piece in the shuffled vector.
+
+    Rationale:
+
+        vs. Sequential: A purely sequential download is inefficient. By randomizing the piece order, the client avoids getting stuck on a slow-to-transfer piece at the beginning of the file and makes progress on other parts simultaneously. This results in a faster time-to-completion.
+
+        vs. Rarest-First: The "rarest-first" algorithm is optimal in swarms with many peers who have different subsets of pieces. However, in this implementation, the client downloads from a single seeder at a time (who has all pieces). Therefore, all pieces are equally "available." The randomized strategy was chosen as the best practical alternative to achieve the desired non-sequential download behavior and parallel efficiency within the project's constraints.
+
+4. Protocol Design Rationale
+
+The network protocol was designed from scratch with simplicity, debuggability, and extensibility in mind.
+
+    Transport Layer: TCP was chosen for its reliability. Its stream-oriented, connection-based nature guarantees that all commands and file pieces arrive in order and without corruption, simplifying the application-layer logic by abstracting away packet loss and reordering.
+
+    Application Layer: A plaintext, space-delimited protocol was designed.
+
+        Rationale: This format is human-readable, making debugging with tools like netcat or wireshark straightforward. It avoids the complexity of binary serialization or the overhead of structured formats like JSON, which would have required external libraries contrary to the project constraints.
+
+        Message Framing: Each command is a single line terminated by a newline character (\n), a simple and standard method for framing messages over a TCP stream.
+
+        Key Design Choices:
+
+            SYNC Prefix: Differentiating tracker-to-tracker commands with a SYNC prefix allows a single listening port on the tracker to handle both client traffic and peer synchronization traffic, simplifying the tracker's design.
+
+            _END_SEEDERS_ Delimiter: The response to a download_file command contains a variable-length list of seeders followed by a variable-length list of piece hashes. A unique delimiter was introduced to allow the client to robustly parse these two distinct lists.
+
+            Client Address in login: To solve the critical "ephemeral port" problem, the login command was designed to carry the client's listening IP:PORT. This allows the tracker to store the correct, stable address for seeding, rather than the temporary port of the client's outgoing connection.
+
+5. Challenges Encountered & Solutions Implemented
+
+    Challenge 1: Tracker Failover and Session Persistence
+
+        Problem: In the initial implementation, when a client reconnected to the secondary tracker after the primary crashed, the secondary tracker would reject the automatic re-login attempt with an "already logged in" error. This left the client connected but unauthenticated.
+
+        Solution: The tracker's login logic was fundamentally changed to be idempotent. It now treats any valid login request as a "session takeover." It first clears any old session associated with that username and then establishes a new session for the current socket connection. This makes the client's failover process completely transparent and seamless.
+
+    Challenge 2: Partial File Piece Transfer
+
+        Problem: The download logic initially used recv with the MSG_WAITALL flag, which blocks until a fixed number of bytes is received. This worked for full-sized pieces but caused the download to hang forever on the final, smaller piece of a file, leading to incomplete downloads.
+
+        Solution: The download_piece_from_peer function was rewritten to use a while loop. The client now reads from the socket in small chunks until the seeder closes the connection (indicated by recv returning 0). This robustly handles pieces of any size.
+
+    Challenge 3: Memory Inefficiency with Large Files
+
+        Problem: The first version of the SHA1 calculation function read the entire file into memory before hashing. This violated the project's efficiency constraints and would have failed for files approaching 1GB.
+
+        Solution: The function was re-implemented to use the OpenSSL streaming API (SHA1_Init, SHA1_Update, SHA1_Final). It now processes files in small, fixed-size chunks, ensuring constant, low memory usage regardless of the file size.

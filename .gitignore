@@ -1,0 +1,13 @@
+# Executables
+client/client
+tracker/tracker
+*.out
+*.o
+*.so
+*.a
+
+# Logs and temporary files
+*.log
+.DS_Store
+.vscode/
+.idea/
